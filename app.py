@@ -143,3 +143,96 @@ def latest_test_record():
             "status": "error",
             "error_type": type(exc).__name__
         }), 500
+
+
+@app.post("/api/rfid-test")
+def rfid_test():
+    data = request.get_json(silent=True) or {}
+
+    node_code = data.get("node_code")
+    uid = data.get("uid")
+
+    if not node_code or not uid:
+        return jsonify({
+            "status": "error",
+            "message": "node_code and uid are required"
+        }), 400
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS rfid_test_scans (
+                        id BIGSERIAL PRIMARY KEY,
+                        node_code VARCHAR(50) NOT NULL,
+                        uid VARCHAR(50) NOT NULL,
+                        scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                """)
+
+                cur.execute("""
+                    INSERT INTO rfid_test_scans (node_code, uid)
+                    VALUES (%s, %s)
+                    RETURNING id, node_code, uid, scanned_at;
+                """, (node_code, uid))
+
+                row = cur.fetchone()
+
+            conn.commit()
+
+        return jsonify({
+            "status": "recorded",
+            "scan": {
+                "id": row[0],
+                "node_code": row[1],
+                "uid": row[2],
+                "scanned_at": row[3].isoformat()
+            }
+        }), 201
+
+    except Exception as exc:
+        logging.exception("RFID test insert failed")
+
+        return jsonify({
+            "status": "error",
+            "error_type": type(exc).__name__
+        }), 500
+
+
+@app.get("/api/rfid-test/latest")
+def latest_rfid_test():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, node_code, uid, scanned_at
+                    FROM rfid_test_scans
+                    ORDER BY id DESC
+                    LIMIT 1;
+                """)
+
+                row = cur.fetchone()
+
+        if row is None:
+            return jsonify({
+                "status": "ok",
+                "scan": None
+            })
+
+        return jsonify({
+            "status": "ok",
+            "scan": {
+                "id": row[0],
+                "node_code": row[1],
+                "uid": row[2],
+                "scanned_at": row[3].isoformat()
+            }
+        })
+
+    except Exception as exc:
+        logging.exception("RFID test read failed")
+
+        return jsonify({
+            "status": "error",
+            "error_type": type(exc).__name__
+        }), 500
