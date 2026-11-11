@@ -236,3 +236,116 @@ def latest_rfid_test():
             "status": "error",
             "error_type": type(exc).__name__
         }), 500
+
+@app.post("/api/comfort-test")
+def comfort_test():
+    data = request.get_json(silent=True) or {}
+
+    node_code = data.get("node_code")
+    temperature_c = data.get("temperature_c")
+    temperature_f = data.get("temperature_f")
+    humidity_percent = data.get("humidity_percent")
+
+    if (
+        not node_code
+        or temperature_c is None
+        or temperature_f is None
+        or humidity_percent is None
+    ):
+        return jsonify({
+            "status": "error",
+            "message": "node_code, temperature_c, temperature_f, and humidity_percent are required"
+        }), 400
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS comfort_test_readings (
+                        id BIGSERIAL PRIMARY KEY,
+                        node_code VARCHAR(50) NOT NULL,
+                        temperature_c NUMERIC(6,2) NOT NULL,
+                        temperature_f NUMERIC(6,2) NOT NULL,
+                        humidity_percent NUMERIC(6,2) NOT NULL,
+                        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                """)
+
+                cur.execute("""
+                    INSERT INTO comfort_test_readings
+                    (node_code, temperature_c, temperature_f, humidity_percent)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id, node_code, temperature_c,
+                              temperature_f, humidity_percent, recorded_at;
+                """, (
+                    node_code,
+                    temperature_c,
+                    temperature_f,
+                    humidity_percent
+                ))
+
+                row = cur.fetchone()
+
+            conn.commit()
+
+        return jsonify({
+            "status": "recorded",
+            "reading": {
+                "id": row[0],
+                "node_code": row[1],
+                "temperature_c": float(row[2]),
+                "temperature_f": float(row[3]),
+                "humidity_percent": float(row[4]),
+                "recorded_at": row[5].isoformat()
+            }
+        }), 201
+
+    except Exception as exc:
+        logging.exception("Comfort test insert failed")
+
+        return jsonify({
+            "status": "error",
+            "error_type": type(exc).__name__
+        }), 500
+
+
+@app.get("/api/comfort-test/latest")
+def latest_comfort_test():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, node_code, temperature_c,
+                           temperature_f, humidity_percent, recorded_at
+                    FROM comfort_test_readings
+                    ORDER BY id DESC
+                    LIMIT 1;
+                """)
+
+                row = cur.fetchone()
+
+        if row is None:
+            return jsonify({
+                "status": "ok",
+                "reading": None
+            })
+
+        return jsonify({
+            "status": "ok",
+            "reading": {
+                "id": row[0],
+                "node_code": row[1],
+                "temperature_c": float(row[2]),
+                "temperature_f": float(row[3]),
+                "humidity_percent": float(row[4]),
+                "recorded_at": row[5].isoformat()
+            }
+        })
+
+    except Exception as exc:
+        logging.exception("Comfort test read failed")
+
+        return jsonify({
+            "status": "error",
+            "error_type": type(exc).__name__
+        }), 500
