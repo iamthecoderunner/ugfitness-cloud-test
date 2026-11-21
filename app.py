@@ -660,6 +660,282 @@ def latest_comfort():
         )
     }), 200
 
+@app.get("/api/occupancy")
+def occupancy():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM visits
+                WHERE visit_status = 'OPEN';
+            """)
+
+            current = cur.fetchone()[0]
+
+    if current <= 5:
+        crowd_status = "LOW"
+    elif current <= 10:
+        crowd_status = "MODERATE"
+    else:
+        crowd_status = "HIGH"
+
+    return jsonify({
+        "status": "ok",
+        "occupancy": current,
+        "crowd_status": crowd_status
+    }), 200
+
+
+@app.get("/api/occupants/current")
+def current_occupants():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT
+                    v.id,
+                    v.check_in_at,
+                    m.member_code,
+                    m.full_name,
+                    w.full_name,
+                    CASE
+                        WHEN v.member_id IS NOT NULL THEN 'MEMBER'
+                        ELSE 'WALK_IN'
+                    END AS occupant_type
+                FROM visits v
+                LEFT JOIN members m
+                    ON m.id = v.member_id
+                LEFT JOIN walkins w
+                    ON w.id = v.walkin_id
+                WHERE v.visit_status = 'OPEN'
+                ORDER BY v.check_in_at DESC;
+            """)
+
+            rows = cur.fetchall()
+
+    occupants = []
+
+    for row in rows:
+        (
+            visit_id,
+            check_in_at,
+            member_code,
+            member_name,
+            walkin_name,
+            occupant_type
+        ) = row
+
+        occupants.append({
+            "visit_id": visit_id,
+            "type": occupant_type,
+            "member_code": member_code,
+            "name": (
+                member_name
+                if occupant_type == "MEMBER"
+                else walkin_name
+            ),
+            "check_in_at": (
+                check_in_at.isoformat()
+                if check_in_at
+                else None
+            )
+        })
+
+    return jsonify({
+        "status": "ok",
+        "count": len(occupants),
+        "occupants": occupants
+    }), 200
+
+
+@app.get("/api/activity/recent")
+def recent_activity():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT
+                    e.id,
+                    e.uid,
+                    e.result_code,
+                    e.message,
+                    e.scanned_at,
+                    n.node_code
+                FROM rfid_scan_events e
+                LEFT JOIN iot_nodes n
+                    ON n.id = e.node_id
+                ORDER BY e.scanned_at DESC
+                LIMIT 20;
+            """)
+
+            rows = cur.fetchall()
+
+    activity = []
+
+    for row in rows:
+        (
+            event_id,
+            uid,
+            result_code,
+            message,
+            scanned_at,
+            node_code
+        ) = row
+
+        activity.append({
+            "id": event_id,
+            "uid": uid,
+            "result": result_code,
+            "message": message,
+            "node_code": node_code,
+            "scanned_at": (
+                scanned_at.isoformat()
+                if scanned_at
+                else None
+            )
+        })
+
+    return jsonify({
+        "status": "ok",
+        "activity": activity
+    }), 200
+
+
+@app.get("/api/nodes")
+def nodes():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT
+                    node_code,
+                    node_type,
+                    location,
+                    firmware_version,
+                    enabled,
+                    last_seen_at,
+                    EXTRACT(
+                        EPOCH FROM (
+                            NOW() - last_seen_at
+                        )
+                    )
+                FROM iot_nodes
+                ORDER BY node_code;
+            """)
+
+            rows = cur.fetchall()
+
+    result = []
+
+    for row in rows:
+        (
+            node_code,
+            node_type,
+            location,
+            firmware_version,
+            enabled,
+            last_seen_at,
+            seconds_since_seen
+        ) = row
+
+        if not enabled:
+            node_status = "DISABLED"
+
+        elif last_seen_at is None:
+            node_status = "UNKNOWN"
+
+        elif seconds_since_seen <= 60:
+            node_status = "ONLINE"
+
+        elif seconds_since_seen <= 180:
+            node_status = "STALE"
+
+        else:
+            node_status = "OFFLINE"
+
+        result.append({
+            "node_code": node_code,
+            "node_type": node_type,
+            "location": location,
+            "firmware_version": firmware_version,
+            "enabled": enabled,
+            "node_status": node_status,
+            "last_seen_at": (
+                last_seen_at.isoformat()
+                if last_seen_at
+                else None
+            )
+        })
+
+    return jsonify({
+        "status": "ok",
+        "nodes": result
+    }), 200
+
+
+@app.post("/api/node-heartbeat")
+def node_heartbeat():
+
+    if not device_authorized():
+        return jsonify({
+            "status": "error",
+            "message": "Unauthorized device"
+        }), 401
+
+    data = request.get_json(silent=True) or {}
+
+    node_code = str(
+        data.get("node_code", "")
+    ).strip()
+
+    firmware_version = str(
+        data.get("firmware_version", "")
+    ).strip() or None
+
+    if not node_code:
+        return jsonify({
+            "status": "error",
+            "message": "node_code is required"
+        }), 400
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                UPDATE iot_nodes
+                SET
+                    last_seen_at = NOW(),
+                    firmware_version =
+                        COALESCE(%s, firmware_version),
+                    updated_at = NOW()
+                WHERE node_code = %s
+                  AND enabled = TRUE
+                RETURNING
+                    node_code,
+                    node_type,
+                    last_seen_at;
+            """, (
+                firmware_version,
+                node_code
+            ))
+
+            row = cur.fetchone()
+
+    if not row:
+        return jsonify({
+            "status": "error",
+            "message": "Unknown or disabled IoT node"
+        }), 404
+
+    return jsonify({
+        "status": "ok",
+        "node_code": row[0],
+        "node_type": row[1],
+        "last_seen_at": row[2].isoformat(),
+        "message": "Heartbeat received"
+    }), 200
+
+
 
 
 if __name__ == "__main__":
