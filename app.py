@@ -462,7 +462,206 @@ def rfid_scan():
                 "message": "Unsupported RFID credential type"
             }), 400
 
-        
+@app.post("/api/comfort-reading")
+def comfort_reading():
+
+    if not device_authorized():
+        return jsonify({
+            "status": "error",
+            "message": "Unauthorized device"
+        }), 401
+
+    data = request.get_json(silent=True) or {}
+
+    node_code = str(data.get("node_code", "")).strip()
+
+    try:
+        temperature_c = float(data.get("temperature_c"))
+        humidity = float(data.get("humidity"))
+    except (TypeError, ValueError):
+        return jsonify({
+            "status": "error",
+            "message": "temperature_c and humidity must be numeric"
+        }), 400
+
+    if not node_code:
+        return jsonify({
+            "status": "error",
+            "message": "node_code is required"
+        }), 400
+
+    if humidity < 0 or humidity > 100:
+        return jsonify({
+            "status": "error",
+            "message": "Humidity must be between 0 and 100"
+        }), 400
+
+    if temperature_c < -20 or temperature_c > 80:
+        return jsonify({
+            "status": "error",
+            "message": "Temperature reading is outside expected range"
+        }), 400
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT
+                    id,
+                    enabled,
+                    node_type
+                FROM iot_nodes
+                WHERE node_code = %s;
+            """, (node_code,))
+
+            node = cur.fetchone()
+
+            if not node:
+                return jsonify({
+                    "status": "error",
+                    "message": "Unknown IoT node"
+                }), 404
+
+            node_id, enabled, node_type = node
+
+            if node_type != "COMFORT":
+                return jsonify({
+                    "status": "error",
+                    "message": "Node is not a comfort-monitoring node"
+                }), 400
+
+            if not enabled:
+                return jsonify({
+                    "status": "error",
+                    "message": "Comfort node is disabled"
+                }), 403
+
+            cur.execute("""
+                UPDATE iot_nodes
+                SET
+                    last_seen_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s;
+            """, (node_id,))
+
+            cur.execute("""
+                INSERT INTO comfort_readings (
+                    node_id,
+                    temperature_c,
+                    humidity_percent
+                )
+                VALUES (%s, %s, %s)
+                RETURNING
+                    id,
+                    recorded_at;
+            """, (
+                node_id,
+                temperature_c,
+                humidity
+            ))
+
+            reading_id, recorded_at = cur.fetchone()
+
+    temperature_f = (temperature_c * 9.0 / 5.0) + 32.0
+
+    return jsonify({
+        "status": "ok",
+        "reading_id": reading_id,
+        "node_code": node_code,
+        "temperature_f": round(temperature_f, 2),
+        "temperature_c": round(temperature_c, 2),
+        "humidity": round(humidity, 2),
+        "recorded_at": recorded_at.isoformat(),
+        "message": "Comfort reading stored"
+    }), 201
+
+
+@app.get("/api/comfort/latest")
+def latest_comfort():
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT
+                    n.node_code,
+                    n.location,
+                    n.last_seen_at,
+                    c.temperature_c,
+                    c.humidity_percent,
+                    c.recorded_at
+                FROM iot_nodes n
+
+                LEFT JOIN LATERAL (
+                    SELECT
+                        temperature_c,
+                        humidity_percent,
+                        recorded_at
+                    FROM comfort_readings
+                    WHERE node_id = n.id
+                    ORDER BY recorded_at DESC
+                    LIMIT 1
+                ) c ON TRUE
+
+                WHERE n.node_code = 'COMFORT-01';
+            """)
+
+            row = cur.fetchone()
+
+    if not row:
+        return jsonify({
+            "status": "error",
+            "message": "COMFORT-01 not found"
+        }), 404
+
+    (
+        node_code,
+        location,
+        last_seen_at,
+        temperature_c,
+        humidity,
+        recorded_at
+    ) = row
+
+    if temperature_c is None:
+        return jsonify({
+            "status": "ok",
+            "node_code": node_code,
+            "location": location,
+            "reading": None,
+            "last_seen_at": (
+                last_seen_at.isoformat()
+                if last_seen_at
+                else None
+            )
+        }), 200
+
+    temperature_c = float(temperature_c)
+    humidity = float(humidity)
+
+    temperature_f = (temperature_c * 9.0 / 5.0) + 32.0
+
+    return jsonify({
+        "status": "ok",
+        "node_code": node_code,
+        "location": location,
+        "temperature_f": round(temperature_f, 2),
+        "temperature_c": round(temperature_c, 2),
+        "humidity": round(humidity, 2),
+        "recorded_at": (
+            recorded_at.isoformat()
+            if recorded_at
+            else None
+        ),
+        "last_seen_at": (
+            last_seen_at.isoformat()
+            if last_seen_at
+            else None
+        )
+    }), 200
+
+
+
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=True)
 
